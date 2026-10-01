@@ -97,6 +97,8 @@ typedef struct pam_handle pam_handle_t;
 #define PAM_AUTH_ERR       7
 #define PAM_IGNORE        25
 
+#define PAM_SILENT      0x8000
+
 extern int  pam_get_user(pam_handle_t *pamh, const char **user, const char *prompt);
 extern void pam_syslog(const pam_handle_t *pamh, int priority, const char *format, ...);
 
@@ -254,8 +256,6 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     int fd;
     int ret = PAM_IGNORE;
 
-    (void)flags;
-
     if (!parse_args(argc, argv, &o)) {
         log_msg(pamh, LOG_ERR,
                 "pam_failguard: invalid module arguments, authentication not restricted");
@@ -264,6 +264,25 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
 
     if (pam_get_user(pamh, &username, NULL) != PAM_SUCCESS ||
         !usable_name(username)) {
+        return PAM_IGNORE;
+    }
+
+    if (flags & PAM_SILENT) {
+        /* Служебный вызов БЕЗ запроса пароля: пользователь ничего не вводил,
+         * значит неудачной попытки не было и засчитывать её нельзя.
+         *
+         * gnome-screensaver при блокировке экрана (Win+L) делает именно
+         * такой вызов, проверяя пользователя, и повторяет его, пока экран
+         * заблокирован. Без этой проверки каждая служебная проверка
+         * засчитывалась как неудача и открывала окно отказа ровно в тот
+         * момент, когда пользователь начинает вводить пароль, а следующая
+         * проверка его продлевала. Из-за этого разблокировать экран было
+         * невозможно вовсе. */
+        if (o.debug) {
+            log_msg(pamh, LOG_DEBUG,
+                    "pam_failguard: PAM_SILENT call for user [%s], ignored",
+                    username);
+        }
         return PAM_IGNORE;
     }
 
@@ -329,10 +348,21 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
             if (left < 1)
                 left = 1;
 
-            /* скользящее окно: продлеваем отказ заново */
-            st.last = now;
-            (void)write_state(fd, &st);
-
+            /* Окно НЕ продлевается: отказ отсчитывается от последней
+             * НЕУДАЧНОЙ попытки, записанной модулем record.
+             *
+             * Продление здесь было бы самоочевидной, но ломающей ошибкой:
+             * верный пароль не является неудачной попыткой, поэтому сдвигать
+             * из-за него таймер нельзя. Диалог блокировки экрана
+             * (gnome-screensaver) повторяет проверку каждые 3 секунды и имеет
+             * жёсткий предел MAX_FAILURES=5 попыток, после которого окно
+             * закрывается вовсе. С продлением окно не истекало никогда, пока
+             * пользователь продолжал жать Enter, и разблокировать экран
+             * становилось невозможно - приходилось выходить и входить через
+             * основное окно входа.
+             *
+             * Скользящее окно при этом сохраняется: каждая новая неудачная
+             * попытка обновляет метку в модуле record. */
             log_msg(pamh, LOG_NOTICE,
                     "pam_failguard: authentication refused for user [%s], %ld failed logins, "
                     "%ld s remaining",
