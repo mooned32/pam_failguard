@@ -81,6 +81,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pwd.h>
 #include <syslog.h>
 
 /* ------------------------------------------------------------------ *
@@ -103,6 +104,14 @@ extern int  pam_get_user(pam_handle_t *pamh, const char **user, const char *prom
 extern void pam_syslog(const pam_handle_t *pamh, int priority, const char *format, ...);
 
 #define STATE_DIR "/var/lib/pam-failguard"
+/*
+ * Каталог состояния принадлежит root, но права 0711, а не 0700: стек PAM при
+ * разблокировке экрана (gnome-screensaver) работает ОТ ИМЕНИ ПОЛЬЗОВАТЕЛЯ, а
+ * не от root, и должен иметь доступ к своему файлу состояния. Право прохода
+ * (x) позволяет открыть файл по известному имени, но не позволяет
+ * перечислить содержимое каталога. Записи в каталог у пользователя нет.
+ */
+#define STATE_DIR_MODE 0711
 #define USERNAME_MAX 256
 #define PATH_MAX_LEN 512      /* STATE_DIR + USERNAME_MAX + разделитель */
 
@@ -202,6 +211,61 @@ open_state(const char *name, char *path, size_t pathlen)
     return open(path, O_RDWR | O_CREAT, 0600);
 }
 
+/* Создать каталог состояния или починить его права.
+ * 0 - ок, 1 - состояние недоступно (тихо выходим), -1 - ошибка (пишем в журнал) */
+static int
+ensure_state_dir(pam_handle_t *pamh)
+{
+    struct stat st;
+
+    if (mkdir(STATE_DIR, STATE_DIR_MODE) == -1 && errno != EEXIST) {
+        /* Каталог не создан и создать его нельзя: типичная ситуация при
+         * разблокировке экрана, где PAM работает от имени пользователя.
+         * Предупреждение здесь только шумит: вход всё равно не блокируется. */
+        if (geteuid() != 0)
+            return 1;
+        log_msg(pamh, LOG_WARNING,
+                "pam_failguard: cannot create %s (%s), authentication not restricted",
+                STATE_DIR, strerror(errno));
+        return -1;
+    }
+
+    /* Прежние версии создавали каталог с правами 0700 - пользователь не мог
+     * до него добраться. Чиним, если мы root. */
+    if (geteuid() == 0 && stat(STATE_DIR, &st) == 0 &&
+        (st.st_mode & 07777) != STATE_DIR_MODE) {
+        if (chmod(STATE_DIR, STATE_DIR_MODE) == -1) {
+            log_msg(pamh, LOG_WARNING,
+                    "pam_failguard: cannot set mode of %s (%s)",
+                    STATE_DIR, strerror(errno));
+        }
+    }
+    return 0;
+}
+
+/*
+ * Файл состояния отдаётся владельцу учётной записи. Иначе его не откроет
+ * стек PAM, работающий от имени пользователя (разблокировка экрана).
+ * На безопасность это не влияет: записать состояние пользователь может
+ * только для себя, а каталог для создания новых файлов закрыт.
+ */
+static void
+own_state_file(int fd, const char *username)
+{
+    struct passwd *pw;
+
+    if (geteuid() != 0)
+        return;                   /* не наш файл - чужие права не трогаем */
+
+    pw = getpwnam(username);
+    if (pw == NULL)
+        return;
+
+    if (fchown(fd, pw->pw_uid, pw->pw_gid) == -1) {
+        /* не критично: root читает и пишет файл при любых правах */
+    }
+}
+
 static int
 read_state(int fd, struct state *st)
 {
@@ -288,20 +352,35 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
 
     now = (long)time(NULL);
 
-    if (mkdir(STATE_DIR, 0700) == -1 && errno != EEXIST) {
-        log_msg(pamh, LOG_WARNING,
-                "pam_failguard: cannot create %s (%s), authentication not restricted",
-                STATE_DIR, strerror(errno));
+    if (ensure_state_dir(pamh) != 0) {
+        if (o.debug) {
+            log_msg(pamh, LOG_DEBUG,
+                    "pam_failguard: state directory unavailable, authentication not restricted");
+        }
         return PAM_IGNORE;
     }
 
     fd = open_state(username, path, sizeof(path));
     if (fd < 0) {
+        /* Стек PAM при разблокировке экрана работает от имени пользователя и
+         * не может создать файл в каталоге состояния: тот принадлежит root.
+         * Это не повод блокировать вход - тихо выходим, при root-side вызове
+         * (su, sudo, ssh, окно входа) файл будет создан. */
+        if (geteuid() != 0 && (errno == EACCES || errno == EPERM ||
+                               errno == ENOENT)) {
+            if (o.debug) {
+                log_msg(pamh, LOG_DEBUG,
+                        "pam_failguard: no state file for user [%s] (%s), not restricted",
+                        username, strerror(errno));
+            }
+            return PAM_IGNORE;
+        }
         log_msg(pamh, LOG_WARNING,
                 "pam_failguard: cannot open state file (%s), authentication not restricted",
                 strerror(errno));
         return PAM_IGNORE;
     }
+    own_state_file(fd, username);
     if (flock(fd, LOCK_EX) == -1) {
         /* не блокируем вход из-за проблем с блокировкой файла */
         close(fd);
