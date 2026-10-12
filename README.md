@@ -88,13 +88,95 @@ else
 ```sh
 make
 # или напрямую:
-cc -Wall -O2 -fPIC -shared -o pam_failguard.so src/pam_failguard.c
+cc -Wall -O2 -fPIC -shared -o pam_failguard.so src/pam_failguard.c -l:libpam.so.0
 ```
+
+Флаг `-l:libpam.so.0` обязателен: без него модуль не загружается там, где
+процесс-владелец не линкует libpam сам — в частности, на экране блокировки
+Ubuntu 15.10 (её аутентифицирует `compiz`). Линкуем по версионному soname,
+чтобы не тянуть `libpam0g-dev`.
+
+## Три вещи, на которых модуль ломается
+
+Проверено на Ubuntu 15.10 (Unity), i686, PAM 1.1.8. Каждая даёт модуль,
+который молча не работает на экране блокировки.
+
+### 1. Линковка с libpam
+
+Считалось, что она не нужна: символы `pam_get_user` и `pam_syslog`
+должны разрешиться из `libpam.so.0` того процесса, который грузит модуль.
+Для `sshd`, `su`, `sudo` это верно. Для блокировки экрана — нет:
+`compiz` обращается к PAM через `dlopen`, и у него `libpam.so.0` не
+глобальна:
+
+```
+compiz: PAM unable to dlopen(pam_failguard.so): undefined symbol: pam_syslog
+compiz: PAM adding faulty module: pam_failguard.so
+```
+
+Решение: `LDFLAGS ?= -l:libpam.so.0` в `Makefile`.
+
+### 2. Каталог установки
+
+PAM ищет модуль не по одному пути, и набор путей зависит от того, как
+процесс подключил libpam:
+
+| Каталог | Кто ищет |
+|---|---|
+| `/lib/i386-linux-gnu/security` | штатная библиотека PAM: `sshd`, `su`, `sudo`, `login` |
+| `/lib/security` | `compiz` — блокировка экрана |
+
+`make install` кладёт модуль в оба (`PAMDIRS`) и печатает отчёт по
+каждому. Без копии в `/lib/security`:
+
+```
+compiz: PAM unable to dlopen(pam_failguard.so): /lib/security/pam_failguard.so:
+        cannot open shared object file: No such file or directory
+```
+
+Эта ошибка маскирует следующую — пока путь не исправлен, `undefined
+symbol` не видно.
+
+### 3. Кэш неудачных загрузок
+
+Linux-PAM запоминает модули, которые не загрузились, **в рамках
+процесса**, и больше не пробует их. Поэтому после исправления `.so`
+процесс, который держит блокировку, нужно перезапустить — на практике
+это перелогин. Иначе он продолжит работать с испорченной записью, и
+модуль будет молча неактивен.
+
+### Кто на самом деле аутентифицирует блокировку
+
+В Ubuntu 15.10 сессия — Unity, и разблокировку обрабатывает **`compiz`**
+через PAM-сервис **`unity`**, а не `gnome-screensaver`:
+
+```
+compiz: pam_unix(unity:auth): authentication failure;
+        logname= uid=1000 euid=1000 tty= ruser= rhost=  user=test
+```
+
+Демон `gnome-screensaver` в Unity не запускается: в его autostart-файле
+`OnlyShowIn=GNOME-Flashback`. Поэтому `Ctrl+Alt+L` и
+`gnome-screensaver-command -l` там не работают. Править `/etc/pam.d/unity`
+не нужно — он подключает `common-auth` через `@include`.
+
+Имя сервиса блокировки можно узнать по `auth.log` после неудачной
+попытки: `pam_unix(<сервис>:auth): authentication failure`. В GNOME это
+`gnome-screensaver`, в Unity 15.10 — `unity`.
+
+### Сборка на EOL-дистрибутиве
+
+Ubuntu 15.10 больше не обслуживается: ветки `wily` на
+`us.archive.ubuntu.com` и `security.ubuntu.com` отдают 404, остались
+только на `old-releases.ubuntu.com`. Если в `/etc/apt/sources.list`
+остались эти адреса, `apt-get update` падает — а с ним сборка и
+установка. Все строки нужно перевести на `old-releases.ubuntu.com`.
+К самому модулю это отношения не имеет, но без этого его не поставить.
 
 ## Установка и откат
 
 ```sh
-make install     # собрать и положить модуль в каталог модулей PAM
+make install     # собрать и положить модуль в оба каталога PAM
 make uninstall   # убрать модуль
 ```
 
@@ -145,9 +227,16 @@ make uninstall   # убрать модуль
 файл состояния отдаётся владельцу учётной записи (`0600`).
 
 Это важно: стек PAM при **разблокировке экрана** работает не от root, а от
-имени пользователя (`pam_unix(gnome-screensaver:auth): ... uid=1000
-euid=1000`). При правах `0700` пользователь не мог открыть свой файл, модуль
-выдавал `cannot open state file (Permission denied)` и **вообще не работал** на
+имени пользователя. Измерено на Ubuntu 15.10 (Unity), где разблокировку
+аутентифицирует `compiz`:
+
+```
+compiz: pam_unix(unity:auth): authentication failure;
+        logname= uid=1000 euid=1000 tty= ruser= rhost=  user=test
+```
+
+При правах `0700` пользователь не мог открыть свой файл, модуль выдавал
+`cannot open state file (Permission denied)` и **вообще не работал** на
 блокировке экрана.
 
 Право прохода (`x`) даёт доступ к своему файлу по известному имени, но не
@@ -185,25 +274,24 @@ su[2705]: pam_failguard(su:auth): pam_failguard: authentication refused for user
 
 ### Блокировка экрана
 
-Проверено на настоящем диалоге `/usr/lib/gnome-screensaver/gnome-screensaver-dialog`
-(не на симуляции), сценарий бага целиком:
+На Ubuntu 15.10 (Unity) проверено на настоящей блокировке, которую
+аутентифицирует `compiz`:
 
 | Шаг | Результат |
 |---|---|
-| окно блокировки показано, неудачная попытка | окно отказа активно |
-| верный пароль сразу | **отказ**, `1 failed logins, 7 s remaining` |
-| пауза 12 с | окно истекло |
-| верный пароль снова | **разблокировка**, `RESPONSE=OK` |
+| неверный пароль | окно отказа активно, состояние записано |
+| верный пароль сразу | **отказ**, `1 failed logins, 6 s remaining` |
+| пауза больше 10 с | окно истекло, файл состояния самоудалён |
+| верный пароль снова | **разблокировка** |
 
 ## Файлы
 
 ```
 src/pam_failguard.c              исходник модуля
-Makefile                         сборка
+Makefile                         сборка и установка в оба каталога PAM
 etc/pam.d/common-auth            итоговый конфиг (снимок из системы)
 etc/pam.d/common-auth.pristine   исходный конфиг (снимок из системы)
 verify/pam-failguard-check.py    проверка исходов и окна
-CHANGES.md                       изменения по замечаниям
 PAM-CONFIG.md                    все правки конфигурации PAM
 ```
 
