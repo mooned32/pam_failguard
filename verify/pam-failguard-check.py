@@ -8,8 +8,11 @@
   * повторный отказ            -> отказ, окно скользит
   * верный пароль после окна   -> вход
   * неудача на просроченном состоянии -> засчитывается
-    (последний шаг - регрессия: раньше просроченный файл состояния
+    (предпоследний шаг - регрессия: раньше просроченный файл состояния
     удалялся, а запись уходила в уже удалённый файл, и неудача терялась)
+  * sudo, неверный + сразу верный -> отказ
+    (sudo передаёт PAM_SILENT при каждом запросе пароля; раньше модуль
+    пропускал такие вызовы и для sudo не работал вообще)
 
 Отказ наступает ПОСЛЕ проверки пароля - этого требует unity-greeter,
 см. README, - поэтому его время сравнимо с обычной попыткой. Проверяется
@@ -19,6 +22,7 @@
 import os
 import pty
 import select
+import subprocess
 import sys
 import time
 
@@ -62,6 +66,25 @@ def attempt(user, pw, timeout=45):
         pass
     ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     return el, ok
+
+
+def attempt_sudo(pws, timeout=45):
+    """Несколько попыток sudo подряд -> (секунды, вошел_ли).
+
+    Пароли отдаются на вход (sudo -S). sudo передаёт PAM флаг PAM_SILENT -
+    именно этот путь и должен учитывать модуль.
+    """
+    t0 = time.time()
+    p = subprocess.Popen(
+        ["sudo", "-S", "-k", "-p", "PWD:", "id", "-un"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    try:
+        p.communicate(input=("\n".join(pws) + "\n").encode(), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+    return time.time() - t0, p.returncode == 0
 
 
 fails = []
@@ -118,6 +141,17 @@ if __name__ == "__main__":
     check("7) неверный после паузы -> отказ", el, ok, False)
     el, ok = attempt(user, good)
     check("8) ВЕРНЫЙ сразу -> отказ (просроченное состояние учтено)", el, ok, False)
+
+    # sudo передаёт PAM_SILENT при каждом запросе пароля. Раньше модуль
+    # пропускал такие вызовы, и для sudo он не работал вовсе: неудача не
+    # засчитывалась, отказа не было. Здесь это проверяется.
+    print("\nПроверка sudo (sudo зовёт PAM с флагом PAM_SILENT):")
+    time.sleep(delay + 1)
+    el, ok = attempt_sudo(["wrongpass", good, "x"])
+    check("9) неверный, затем ВЕРНЫЙ сразу -> отказ", el, ok, False)
+    time.sleep(delay + 1)
+    el, ok = attempt_sudo([good])
+    check("10) ВЕРНЫЙ после паузы -> вход", el, ok, True)
 
     print()
     if fails:

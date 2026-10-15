@@ -100,8 +100,6 @@ typedef struct pam_handle pam_handle_t;
 #define PAM_AUTH_ERR       7
 #define PAM_IGNORE        25
 
-#define PAM_SILENT      0x8000
-
 extern int  pam_get_user(pam_handle_t *pamh, const char **user, const char *prompt);
 extern void pam_syslog(const pam_handle_t *pamh, int priority, const char *format, ...);
 
@@ -335,24 +333,19 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
         return PAM_IGNORE;
     }
 
-    if (flags & PAM_SILENT) {
-        /* Служебный вызов БЕЗ запроса пароля: пользователь ничего не вводил,
-         * значит неудачной попытки не было и засчитывать её нельзя.
-         *
-         * gnome-screensaver при блокировке экрана (Win+L) делает именно
-         * такой вызов, проверяя пользователя, и повторяет его, пока экран
-         * заблокирован. Без этой проверки каждая служебная проверка
-         * засчитывалась как неудача и открывала окно отказа ровно в тот
-         * момент, когда пользователь начинает вводить пароль, а следующая
-         * проверка его продлевала. Из-за этого разблокировать экран было
-         * невозможно вовсе. */
-        if (o.debug) {
-            log_msg(pamh, LOG_DEBUG,
-                    "pam_failguard: PAM_SILENT call for user [%s], ignored",
-                    username);
-        }
-        return PAM_IGNORE;
-    }
+    /* Флаг PAM_SILENT намеренно НЕ учитывается.
+     *
+     * Раньше такие вызовы пропускались: молчаливый вызов считался проверкой
+     * без запроса пароля, а значит и без неудачи. Для gnome-screensaver это,
+     * возможно, и верно - но sudo передаёт PAM_SILENT ВСЕГДА. Он сам печатает
+     * приглашение "[sudo] password" и просит PAM не дублировать вывод. Из-за
+     * пропуска модуль не работал для sudo вообще: ни одна попытка не
+     * засчитывалась и отказа не было.
+     *
+     * Расплаты за отказ от этой проверки на целевой системе нет: compiz
+     * (блокировка экрана Unity) обращается к PAM обычным образом, молчаливых
+     * вызовов в журнале нет. Проверено на sudo 1.8.12, Ubuntu 15.10. */
+    (void)flags;
 
     now = (long)time(NULL);
 
